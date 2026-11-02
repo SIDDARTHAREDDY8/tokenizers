@@ -1755,6 +1755,76 @@ mod tests {
         assert_eq!(pipeline.decode_tokens(&[7, 99, 4], false), ["hello", "he"]);
     }
 
+    // A valid character in a byte run must survive streaming when a stray
+    // byte follows it: the stream emits the character from the valid prefix,
+    // and the next decode still extends that prefix instead of raising the
+    // invalid-prefix error the all-replacement decode produced.
+    #[cfg(feature = "wordlevel")]
+    #[test]
+    fn decode_stream_keeps_valid_char_before_stray_byte() {
+        use crate::decoders::byte_fallback::ByteFallback;
+        use ahash::AHashMap;
+
+        let mut names: Vec<String> = vec!["<unk>".into(), "a".into(), "ok".into()];
+        names.extend((0..=u8::MAX).map(|i| format!("<0x{i:02X}>")));
+        let vocab: AHashMap<String, u32> = names
+            .iter()
+            .enumerate()
+            .map(|(id, token)| (token.clone(), id as u32))
+            .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("<unk>".to_string())
+            .build()
+            .unwrap();
+        let pipeline = PipelineTokenizer::from_parts(
+            BucketAddedVocabulary::new(),
+            Vec::new(),
+            PipelinePreTokenizer::None,
+            PipelineModel::WordLevel(model),
+            PipelinePostProcessor::default(),
+            Some(DecoderRuntime::ByteFallback(ByteFallback::new())),
+            Default::default(),
+            None,
+            None,
+        );
+
+        // `a`, then U+20000 as `F0 A0 80 80`, then a stray `E4`, then `ok`.
+        let tokens = ["a", "<0xF0>", "<0xA0>", "<0x80>", "<0x80>", "<0xE4>", "ok"];
+        let ids: Vec<u32> = tokens
+            .iter()
+            .map(|token| pipeline.token_to_id(token).unwrap())
+            .collect();
+        assert_eq!(
+            pipeline.decode(&ids, false).unwrap(),
+            "a\u{20000}\u{fffd}ok"
+        );
+
+        let mut stream = pipeline.decode_stream(false);
+        let mut streamed = String::new();
+        let mut steps = Vec::new();
+        for &id in &ids {
+            let step = stream.step(id).unwrap();
+            if let Some(text) = &step {
+                streamed.push_str(text);
+            }
+            steps.push(step);
+        }
+        assert_eq!(
+            steps,
+            [
+                Some("a".to_string()),
+                None,
+                None,
+                None,
+                Some("\u{20000}".to_string()),
+                None,
+                Some("\u{fffd}ok".to_string()),
+            ]
+        );
+        assert_eq!(streamed, "a\u{20000}\u{fffd}ok");
+    }
+
     #[test]
     fn decode_tokens_skips_special_tokens_on_request() {
         use crate::vocab::bucket_added_vocabulary::AddedToken;
